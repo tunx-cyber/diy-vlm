@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.model import CausalModel
-from model.tokenizer import tokenizer
+from model.tokenizer import tokenizer, vocab_size
 
 
 def pick_device(requested: str = "auto") -> str:
@@ -93,7 +93,7 @@ class TextStreamer:
 def load_model(ckpt: str, device: str) -> CausalModel:
     model = CausalModel(
         layers=8,
-        vocab_size=248044,
+        vocab_size=vocab_size,
         kv_heads=8,
         attn_heads=32,
         hidden_dim=512,

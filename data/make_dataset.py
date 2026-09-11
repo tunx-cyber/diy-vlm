@@ -16,7 +16,10 @@ class PretrainDataset(Dataset):
         self.data = []
         with open(data_path,"r") as f:
             for line in tqdm(f):
-                raw = json.loads(line)
+                try:
+                    raw = json.loads(line)
+                except:
+                    continue
                 if raw:
                     self.data.append(raw["text"])
         self.tokenizer = tokenizer

@@ -1,7 +1,7 @@
 import torch
 from torch.optim import AdamW
 from model.model import CausalModel
-from model.tokenizer import tokenizer
+from model.tokenizer import tokenizer, vocab_size
 from data.make_dataset import PretrainDataset
 from torch.utils.data import DataLoader
 import json
@@ -17,7 +17,7 @@ def train(data_path: str, epochs=1, device="mps"):
     dataloader = DataLoader(pt_ds,batch_size=32)
     model = CausalModel(
         layers=8,
-        vocab_size=248044,
+        vocab_size=vocab_size,
         kv_heads=8,
         attn_heads=32,
         hidden_dim=512,
