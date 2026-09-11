@@ -99,8 +99,9 @@ class Attention(nn.Module):
         xk = repeat_kv(xk, self.n_rep).transpose(1,2)
         xv = repeat_kv(xv, self.n_rep).transpose(1,2)
 
-        if self.flash_attn and seq_len > 1:
-            output = F.scaled_dot_product_attention(xq,xv,xv,attention_mask,self.dropout if self.training else 0.0,is_causal=self.is_causal)
+        if self.flash_attn and seq_len > 1 and attention_mask is None:
+            # 带 padding mask 时走下面的手写分支，SDPA 不接受 (bsz, kv_len) 形状的 float mask
+            output = F.scaled_dot_product_attention(xq,xk,xv,attention_mask,self.dropout if self.training else 0.0,is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
             if self.is_causal:
@@ -250,6 +251,23 @@ class Model(nn.Module):
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
+class CausalLMOutput:
+    """CausalModel 的推理输出，提供和 transformers 一致的字段名。
+
+    generate() 依赖 `.logits` 和 `.past_key_values`；带 labels 训练时
+    forward 仍然直接返回 loss 张量，不影响 train/pretrain.py 的写法。
+    """
+
+    def __init__(self, logits=None, past_key_values=None, loss=None, aux_loss=None):
+        self.logits = logits
+        self.past_key_values = past_key_values
+        self.loss = loss
+        self.aux_loss = aux_loss
+
+    def __getitem__(self, item):
+        return (self.logits, self.past_key_values, self.loss)[item]
+
+
 class CausalModel(nn.Module):
     def __init__(
             self,
@@ -298,7 +316,8 @@ class CausalModel(nn.Module):
         if labels is not None:
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return loss
+            return loss
+        return CausalLMOutput(logits=logits, past_key_values=past_key_values, aux_loss=aux_loss)
 
     @torch.inference_mode()
     def generate(
