@@ -20,6 +20,8 @@ import torch
 # 直接 `python infer/simple_infer.py` 时把项目根目录加进 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from model.checkpoint import load_into, read_config
+from model.config import ModelConfig, default_config
 from model.model import CausalModel
 from model.tokenizer import tokenizer, vocab_size
 
@@ -91,26 +93,16 @@ class TextStreamer:
 
 
 def load_model(ckpt: str, device: str) -> CausalModel:
-    model = CausalModel(
-        layers=8,
-        vocab_size=vocab_size,
-        kv_heads=8,
-        attn_heads=32,
-        hidden_dim=512,
-        intermediate_dim=int(512 * 8 / 3),
-        max_position_embeddings=16 * 1024,
-        rope_base=1e6,
-    )
-    if ckpt and os.path.exists(ckpt):
-        state_dict = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state_dict)
-        print(f"[info] 已加载权重 {ckpt}", file=sys.stderr)
-    else:
-        print(
-            f"[warn] 没找到权重文件 {ckpt}，用随机初始化权重跑（只用于验证流式输出链路）",
-            file=sys.stderr,
-        )
-    return model.to(device).eval()
+    # 先只读 config 建模型（pt / safetensors / dcp 三种格式都支持），
+    # 架构必须和训练时一致，否则权重 shape 对不上。
+    # 老格式的裸 state_dict 没存 config，只能退回 model/config.py 的默认配置。
+    cfg = read_config(ckpt) or default_config(vocab_size=vocab_size)
+    model = CausalModel(**cfg.model_kwargs())
+    load_into(model, ckpt, config=cfg)
+    model.to(device)
+    model.eval()
+    model.config = cfg
+    return model
 
 
 def stream_generate(
