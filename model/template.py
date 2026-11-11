@@ -236,8 +236,8 @@ def apply_chat_template(
     elif start == 1:  # 首条是 system 但内容为空，官方也会输出一个空的 system 块
         chat += f"{bos_token}system\n{system_content}{eos_token}\n"
 
-    if not any(msg["role"] == "user" for msg in messages):
-        raise ValueError("没有 user query，样本不合法")
+    # if not any(msg["role"] == "user" for msg in messages):
+    #     raise ValueError("没有 user query，样本不合法")
 
     images = []  # 全局图片地址数组，顺序 == 文本里 <|image_pad|> 的顺序
     for msg in messages[start:]:
