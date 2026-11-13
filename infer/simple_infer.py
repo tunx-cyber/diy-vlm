@@ -20,10 +20,34 @@ import torch
 # 直接 `python infer/simple_infer.py` 时把项目根目录加进 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model.checkpoint import load_into, read_config
-from model.config import ModelConfig, default_config
-from model.model import CausalModel
+from model.model import VisionModel
 from model.tokenizer import tokenizer, vocab_size
+
+
+def load_model(ckpt_path: str, device: str) -> VisionModel:
+    """从训练脚本存下的 ckpt 里恢复文本模型。
+    """
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = (state.get("extra") or {}).get("train_args", {})
+    model = VisionModel(
+        vision_model_path="google/siglip2-base-patch32-256",
+        image_token_id=tokenizer.convert_tokens_to_ids("<|image_pad|>"),
+        layers=cfg.get("layers", 8),
+        vocab_size=vocab_size,
+        kv_heads=cfg.get("kv_heads", 8),
+        attn_heads=cfg.get("attn_heads", 32),
+        hidden_dim=cfg.get("hidden_dim", 512),
+        intermediate_dim=cfg.get("intermediate_dim", 512 * 3 // 8),
+        max_position_embeddings=cfg.get("max_position_embeddings", 16 * 1024),
+        rope_base=cfg.get("rope_base", 1e6),
+    )
+    missing, unexpected = model.load_state_dict(state["model"], strict=False)
+    bad = [k for k in missing if not k.startswith("vision_encoder.")]
+    if bad:
+        raise RuntimeError(f"ckpt 与模型结构不匹配，缺少 {bad[:5]}（共 {len(bad)} 个）")
+    if unexpected:
+        raise RuntimeError(f"ckpt 里有多余权重 {unexpected[:5]}")
+    return model.to(device).eval()
 
 
 def pick_device(requested: str = "auto") -> str:
@@ -92,23 +116,10 @@ class TextStreamer:
             yield chunk
 
 
-def load_model(ckpt: str, device: str) -> CausalModel:
-    # 先只读 config 建模型（pt / safetensors / dcp 三种格式都支持），
-    # 架构必须和训练时一致，否则权重 shape 对不上。
-    # 老格式的裸 state_dict 没存 config，只能退回 model/config.py 的默认配置。
-    cfg = read_config(ckpt) or default_config(vocab_size=vocab_size)
-    model = CausalModel(**cfg.model_kwargs())
-    load_into(model, ckpt, config=cfg)
-    model.to(device)
-    model.eval()
-    model.config = cfg
-    return model
-
-
 def stream_generate(
-    model: CausalModel,
+    model: VisionModel,
     prompt: str,
-    device: str = "cpu",
+    device: str = "cuda:0",
     max_new_tokens: int = 256,
     temperature: float = 0.85,
     top_p: float = 0.85,
@@ -118,7 +129,7 @@ def stream_generate(
     use_cache: bool = True,
 ):
     """流式生成并直接打印，返回 (prompt + 生成文本, 生成 token 数)。"""
-    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids
     input_ids = input_ids.to(device)
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
@@ -176,7 +187,7 @@ def stream_generate(
 def main():
     parser = argparse.ArgumentParser(description="KV Cache 流式推理")
     parser.add_argument("--ckpt", default="200.pth", help="权重路径")
-    parser.add_argument("--prompt", default="once upon a time")
+    parser.add_argument("--prompt", default="<im_start>assistant\nonce upon a time")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--top-p", type=float, default=0.85)
