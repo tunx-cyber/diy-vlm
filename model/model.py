@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional, Tuple, List, Union
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float=1e-5):
         super().__init__()
@@ -90,7 +91,13 @@ class Attention(nn.Module):
         self.is_causal = is_causal
         self.flash_attn = hasattr(F,'scaled_dot_product_attention')
 
-    def _attn_mask(self, bsz: int, seq_len: int, kv_len: int, attention_mask, device, force: bool = False):
+    def build_attn_mask(self, bsz: int, seq_len: int, kv_len: int, attention_mask, device, force: bool = False):
+        if attention_mask is not None and attention_mask.shape[-1] != kv_len:
+            # 否则下面 reshape 会抛 "shape '[1,1,1,12]' is invalid for input of size 11"，
+            # 完全看不出是 mask 长度错了
+            raise ValueError(
+                f"attention_mask 长度({attention_mask.shape[-1]})和 kv_len({kv_len})不一致："
+                "增量解码时要保证 mask 覆盖 [0, past_len + 新 token)")
         if seq_len > kv_len:
             # query 比 key 还长时，右下角对齐的因果 mask 会出现整行全 False，
             # softmax 全 -inf 直接产生 NaN（不报错，最难查）
@@ -142,7 +149,7 @@ class Attention(nn.Module):
         xk = repeat_kv(xk, self.n_rep).transpose(1,2)
         xv = repeat_kv(xv, self.n_rep).transpose(1,2)
 
-        attn_mask = self._attn_mask(bsz, seq_len, kv_len, attention_mask, xq.device, force=not self.flash_attn)
+        attn_mask = self.build_attn_mask(bsz, seq_len, kv_len, attention_mask, xq.device, force=not self.flash_attn)
         if self.flash_attn:
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
@@ -249,7 +256,7 @@ class Model(nn.Module):
             dropout: float = 0,
         ):
         super().__init__()
-        self.embeddig = nn.Embedding(vocab_size,hidden_dim)
+        self.embedding = nn.Embedding(vocab_size,hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList(
             DecoderBlock(
@@ -270,14 +277,14 @@ class Model(nn.Module):
         self.rope_scaling = rope_scaling
         self.register_buffer("freqs_cos", None, persistent=False)
         self.register_buffer("freqs_sin", None, persistent=False)
-        self._rope_ready = False
-        self._init_rope_buffers()
+        self.rope_ready = False
+        self.init_rope_buffers()
 
-    def _init_rope_buffers(self, device=None, dtype=None):
+    def init_rope_buffers(self, device=None, dtype=None):
         if device is None:
-            device = self.embeddig.weight.device
+            device = self.embedding.weight.device
         if dtype is None:
-            dtype = self.embeddig.weight.dtype
+            dtype = self.embedding.weight.dtype
         freqs_cos, freqs_sin = precompute_freqs_cis(
             dim=self.rope_dim,
             end=self.rope_end,
@@ -286,11 +293,7 @@ class Model(nn.Module):
         )
         self.freqs_cos = freqs_cos.to(device=device, dtype=dtype)
         self.freqs_sin = freqs_sin.to(device=device, dtype=dtype)
-        self._rope_ready = True
-
-    def _apply(self, fn, *args, **kwargs):
-        self._rope_ready = False
-        return super()._apply(fn, *args, **kwargs)
+        self.rope_ready = True
 
     def forward(
             self,
@@ -298,27 +301,40 @@ class Model(nn.Module):
             attention_mask=None, 
             past_key_values=None, 
             use_cache=False, 
+            inputs_embeds=None,
             **kwargs
         ):
-        batch_size, seq_len = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+        # 方便vision model透传
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("input_ids 和 inputs_embeds 必须且只能传一个")
+        if inputs_embeds is not None:
+            hidden_states = self.dropout(inputs_embeds)
+            seq_len = hidden_states.shape[1]
+        else:
+            hidden_states = self.dropout(self.embedding(input_ids))
+            seq_len = input_ids.shape[1]
+
+        # 处理past_kv
+        if past_key_values is not None and not isinstance(past_key_values, (list, tuple)):
+            raise TypeError(
+                f"past_key_values 需要 list[(k, v)]，收到 {type(past_key_values).__name__}；"
+                "HF 的 DynamicCache 请先用 to_legacy_cache() 转换")
         if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
-        if len(past_key_values) != len(self.layers):
+            past_key_values = (None,) * len(self.layers)   # 元组，不额外占用/可共享
+        elif len(past_key_values) != len(self.layers):
             raise ValueError(
                 f"past_key_values 长度({len(past_key_values)})和层数({len(self.layers)})不一致，"
-                "请确认传回来的是同一个模型、且 use_cache 状态一致")
+                "请确认传回来的是同一个模型")
         start_pos = 0
         for past in past_key_values:
             if past is not None:
                 start_pos = past[0].shape[1]
                 break
-        hidden_states = self.dropout(self.embeddig(input_ids))
         # RoPE 表按需重建（正常训练/推理只在第一次 forward 触发一次）
-        if (not self._rope_ready or self.freqs_cos is None
+        if (not self.rope_ready or self.freqs_cos is None
                 or self.freqs_cos.is_meta
                 or self.freqs_cos.device != hidden_states.device):
-            self._init_rope_buffers(hidden_states.device, self.embeddig.weight.dtype)
+            self.init_rope_buffers(hidden_states.device, self.embedding.weight.dtype)
         if start_pos + seq_len > self.freqs_cos.shape[0]:
             raise ValueError(
                 f"位置超出 RoPE 预计算范围：需要 [{start_pos}, {start_pos + seq_len})，"
@@ -354,7 +370,7 @@ class CausalLMOutput:
         return (self.logits, self.past_key_values, self.loss)[item]
 
 
-class CausalModel(nn.Module):
+class TextModel(nn.Module):
     def __init__(
             self,
             layers:int ,
@@ -393,9 +409,10 @@ class CausalModel(nn.Module):
             use_cache=False, 
             logits_to_keep=0, 
             labels=None, 
+            inputs_embeds=None,
             **kwargs
         ):
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, inputs_embeds=inputs_embeds, **kwargs)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.model_head(hidden_states[:, slice_indices, :])
         loss = None
@@ -422,14 +439,11 @@ class CausalModel(nn.Module):
             eos_token_id=None, 
             streamer=None, 
             use_cache=True, 
-            num_return_sequences=1, 
             do_sample=True, 
             repetition_penalty=1.0, 
             **kwargs
         ):
-        # eos 默认 None：以前硬编码 2，和 tokenizer（Qwen 系 eos 不是 2）对不上，
-        # 直接用默认值会在错误的 token 上提前停止。调用方应传 tokenizer.eos_token_id，
-        # 传 None 表示不提前停止（跑满 max_new_tokens）。
+
         input_ids = kwargs.pop("input_ids", inputs)
         if input_ids is None:
             raise ValueError("generate 需要传入 inputs（或 input_ids）")
@@ -447,8 +461,6 @@ class CausalModel(nn.Module):
         input_ids = input_ids.to(device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        input_ids = input_ids.repeat(num_return_sequences, 1)
-        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
         if temperature <= 0:
             raise ValueError("temperature 必须 > 0；要贪心解码请用 do_sample=False")
@@ -490,7 +502,6 @@ class CausalModel(nn.Module):
         return input_ids
 
 
-
 class VisionProjector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -504,10 +515,17 @@ class VisionProjector(nn.Module):
     def forward(self, x):
         return self.mlp(x)
 
-class VisionModel(CausalModel):
+try:  # 既支持 `import model.model`，也支持直接运行本文件
+    from .vision import load_siglip_vision_tower
+except ImportError:  # pragma: no cover
+    from vision import load_siglip_vision_tower
+
+
+class VisionModel(TextModel):
     def __init__(
             self,
             vision_model_path: str,# google/siglip2-base-patch32-256
+            image_token_id: int,
             layers:int ,
             vocab_size:int, 
             kv_heads: int,
@@ -519,93 +537,140 @@ class VisionModel(CausalModel):
             rope_scaling = None,
             norm_eps: float = 1e-6,
             dropout: float = 0,
-            image_ids = None,
         ):
         super().__init__(
-            layers=layers,
-            vocab_size=vocab_size,
-            kv_heads=kv_heads,
-            attn_heads=attn_heads,
-            hidden_dim=hidden_dim,
-            intermediate_dim=intermediate_dim,
-            max_position_embeddings=max_position_embeddings,
-            rope_base=rope_base,
-            rope_scaling=rope_scaling,
-            norm_eps=norm_eps,
-            dropout=dropout
+            layers=layers, vocab_size=vocab_size, kv_heads=kv_heads, attn_heads=attn_heads,
+            hidden_dim=hidden_dim, intermediate_dim=intermediate_dim,
+            max_position_embeddings=max_position_embeddings, rope_base=rope_base,
+            rope_scaling=rope_scaling, norm_eps=norm_eps, dropout=dropout,
         )
-        self.image_ids = list(image_ids) if image_ids else []
-        from transformers import AutoModel, AutoProcessor
-        self.vision_encoder = AutoModel.from_pretrained(vision_model_path).eval()
-        for param in self.vision_encoder.parameters():
-            param.requires_grad = False
-        self.processor = AutoProcessor.from_pretrained(vision_model_path)
+        self.image_token_id = image_token_id
+        # 纯 PyTorch 的视觉塔，权重直接从 safetensors 读，不经过 transformers
+        self.vision_encoder, self.image_config = load_siglip_vision_tower(vision_model_path)
+        self.vision_hidden_size = self.vision_encoder.hidden_size
+        self.num_image_tokens = self.vision_encoder.num_patches
+        self.vision_proj = VisionProjector(
+            in_dim=self.vision_hidden_size, out_dim=hidden_dim)
 
-    @staticmethod
-    def image2tensor(image, processor):
-        if image.mode in ['RGBA', 'LA']: image = image.convert('RGB')
-        inputs = processor(images=image, return_tensors="pt")
-        return inputs
-    
-    @staticmethod
-    def get_image_embeddings(image_inputs, vision_model):
-        if hasattr(image_inputs, 'keys'):
-            image_inputs = {k: v.squeeze(1) if v.ndim > 2 and v.shape[1] == 1 else v for k, v in image_inputs.items()}
-        with torch.no_grad():
-            outputs = vision_model(**image_inputs)
-        return outputs.last_hidden_state
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.vision_encoder.eval()   # 冻结塔永远 eval，否则父类 .train() 会把它一起打开
+        return self
 
-    @torch.compiler.disable
-    def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
-        if vision_tensors is None or not self.image_ids:
-            return h
-        marker, vf = self.image_ids[0], vision_tensors
-        if vf.dim() == 3:
-            vf = vf.unsqueeze(1)
-        out = []
-        for b in range(h.size(0)):
-            hb, seq, k, i = h[b], tokens[b].tolist(), 0, 0
-            while i < len(seq):
-                if seq[i] == marker:
-                    start = i
-                    while i < len(seq) and seq[i] == marker:
-                        i += 1
-                    if k < vf.size(1):
-                        hb = torch.cat((hb[:start], vf[b][k][:i - start], hb[i:]), dim=0)[:seqlen]
-                        k += 1
-                else:
-                    i += 1
-            out.append(hb)
-        return torch.stack(out)
+    @torch.no_grad()
+    def encode_frozen(self, pixel_values):
+        """只跑冻结的视觉塔，返回 [N * P, C] 的特征（不带梯度）。"""
+        vp = self.vision_encoder
+        param = next(vp.parameters())
+        feats = vp(pixel_values.to(device=param.device, dtype=param.dtype))  # [N, P, C]
+        n, p, c = feats.shape
+        if p != self.num_image_tokens:
+            raise ValueError(
+                f"视觉塔输出 {p} 个 token，但模板里每张图是 {self.num_image_tokens} 个 "
+                "IMAGE_TOKEN_LEN：两者必须一致")
+        return feats.reshape(n * p, c)
 
+    def encode_images(self, pixel_values, dtype):
+        """pixel_values: [N, 3, 256, 256] -> [N * P, out_dim]
 
-def main():
-    from model.config import default_config
-    config = default_config(vocab_size=6400)
-    model = CausalModel(**config.model_kwargs())
+        投影层必须留在 no_grad 外面，否则 vision_proj 永远拿不到梯度，
+        训练时 loss 照降（文本塔在学），但视觉对齐完全没生效。
+        """
+        if pixel_values is None:
+            return None
+        feats = self.encode_frozen(pixel_values)
+        return self.vision_proj(feats.to(dtype))
 
-    num_params = sum(p.numel() for p in model.parameters())
-    print(num_params/(1024*1024))
-    input_ids = torch.randint(1, 127, (8, 128))
-    labels_ids = input_ids.clone()
+    def replace_vision_marker_embedding(self, input_ids, vision_embeds,
+                                        inputs_embeds=None, image_token_id=None):
+        token_id = self.image_token_id if image_token_id is None else image_token_id
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embedding(input_ids)
+        if vision_embeds is None:
+            return inputs_embeds
+        marker = input_ids.eq(token_id)
+        if int(marker.sum()) != vision_embeds.shape[0]:
+            raise ValueError(
+                f"图像特征数({vision_embeds.shape[0]})和 <|image_pad|> 数({int(marker.sum())})不一致")
+        inputs_embeds = inputs_embeds.clone()
+        inputs_embeds[marker] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
 
-    outputs = model(input_ids, labels=labels_ids)
-    print(outputs.loss)
+    def forward(
+            self,
+            input_ids: torch.Tensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+            use_cache: bool = False,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
+            labels: Optional[torch.Tensor] = None,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            vision_embeds: Optional[torch.Tensor] = None,
+            image_token_id: Optional[int] = None,
+            **kwargs
+        ):
+        if input_ids is None:
+            raise ValueError("VisionModel.forward 需要 input_ids：要用它定位 <|image_pad|>")
+        token_id = self.image_token_id if image_token_id is None else image_token_id
 
-    Atten = Attention(8,8,128)
-    print(Atten._attn_mask(1,4,4,None,"cpu",force=True))
+        inputs_embeds = self.model.embedding(input_ids)
+        marker = input_ids.eq(token_id)
 
-if __name__ == '__main__':
-    # 让 `python model/model.py` 和 `python -m model.model` 都能跑 main()：
-    # 脚本方式下 sys.path[0] 是 model/ 目录，里面的 model.py 会把 model 包
-    # 遮蔽掉（`from model.config import ...` 会报 "model is not a package"），
-    # 所以把脚本目录移出 sys.path，并把项目根目录放到首位。
-    # 原来的自检硬编码 device="mps"、且 Attention(4,8,12) 是非法配置
-    # （hidden_dim 12 不能被 attn_heads 8 整除），在没有 MPS 的机器上会直接崩。
-    import os
-    import sys
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _root = os.path.dirname(_here)
-    sys.path[:] = [p for p in sys.path if os.path.abspath(p) != _here]
-    sys.path.insert(0, _root)
-    main()
+        # 只有 prefill 才可能有 image_pad。用 past 是否为空来判断，而不是
+        # marker.any()：后者会每步触发一次 GPU->CPU 同步，而且在 use_cache=False
+        # 的生成里会让每个 token 都重跑一遍视觉塔。
+        has_past = past_key_values is not None and any(p is not None for p in past_key_values)
+        if not has_past and bool(marker.any()):
+            if vision_embeds is None:
+                if pixel_values is None:
+                    raise ValueError("序列里有 <|image_pad|> 但没传 pixel_values")
+                vision_embeds = self.encode_images(pixel_values, dtype=inputs_embeds.dtype)
+            inputs_embeds = self.replace_vision_marker_embedding(
+                input_ids, vision_embeds, inputs_embeds, token_id)
+
+        if labels is not None:
+            labels = labels.clone()
+            labels[marker] = -100   # 图像 token 不参与 loss
+
+        return super().forward(
+            input_ids=None,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+            labels=labels,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+
+    @torch.inference_mode()
+    def generate(
+            self,
+            inputs=None,
+            attention_mask=None,
+            *,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            **kwargs
+        ):
+        """带图生成。
+
+        父类的 generate 每一步都会调 self.forward(...) 并原样透传 kwargs，
+        所以这里先把图片编码一次，再把 vision_embeds 透传下去。
+
+        pixel_values 是 keyword-only：父类签名里第 2 个位置参数是 attention_mask，
+        写成 model.generate(prompt, pv) 会把图片当成 mask 传进去，报错完全看不出原因。
+        """
+        # 视觉塔只跑一次，把特征直接透传给每一步的 forward。
+        # 否则 use_cache=False 时每个 token 都要重跑一遍 12 层视觉塔。
+        vision_embeds = None
+        if pixel_values is not None:
+            dtype = next(self.parameters()).dtype
+            vision_embeds = self.encode_images(pixel_values, dtype=dtype)
+
+        return super().generate(
+            inputs=inputs,
+            attention_mask=attention_mask,
+            vision_embeds=vision_embeds,
+            **kwargs,
+        )
+
